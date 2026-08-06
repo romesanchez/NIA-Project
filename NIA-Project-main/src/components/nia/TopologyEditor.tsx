@@ -1,9 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { jsPDF } from "jspdf";
+import { Document, ImageRun, Packer, Paragraph, HeadingLevel, AlignmentType } from "docx";
 import type { Department, DeviceType } from "@/data/departments";
 import { useTopologyLayout } from "@/hooks/useTopologyLayout";
 import { CONN_TYPE_LABELS, ConnType, computeLabelBox, LABEL_FONT_SIZE, LABEL_LINE_HEIGHT, LABEL_PAD_X, LABEL_PAD_Y, uid } from "@/lib/deptLayout";
 import { TOPO_PAD, TOPO_VB_H, TOPO_VB_W, topologyConnectorStyle } from "@/lib/topologyLayout";
 import { DeviceGlyph, DEVICE_LABELS, DEVICE_FULL_LABELS } from "./DeviceGlyph";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 interface Props { dept: Department }
 
@@ -22,6 +31,69 @@ const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 2.5;
 const ZOOM_STEP = 0.15;
 const clampZoom = (z: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+
+// (no long-press constants — group copy now fires immediately on drag)
+
+// The canvas draws everything with var(--color-*) theme tokens so it matches
+// the rest of the app. A print/PDF window is a blank document with none of
+// that CSS loaded, so we copy the current computed values of just the
+// tokens the topology SVG actually uses into it — otherwise wires, chips,
+// and text would render as browser-default black.
+const PRINT_CSS_VARS = [
+  "--color-background", "--color-ink", "--color-border", "--color-tint",
+  "--color-primary", "--color-primary-foreground", "--color-accent",
+  "--color-destructive", "--color-muted-foreground", "--font-mono",
+];
+
+// Clones the live topology SVG, strips the editor-only grid background and
+// dashed canvas-bounds rect (clutter on a printed page/exported file), and
+// inlines the current values of every var(--color-*) token it uses — a
+// canvas/export context has no app stylesheet, so the raw CSS vars would
+// otherwise resolve to nothing and everything would render black.
+function cleanSvgForExport(svg: SVGSVGElement): SVGSVGElement {
+  const clone = svg.cloneNode(true) as SVGSVGElement;
+  const rects = clone.querySelectorAll(":scope > rect");
+  rects.forEach((r, i) => { if (i < 2) r.remove(); }); // grid bg + dashed bounds
+  const rootStyle = getComputedStyle(document.documentElement);
+  const varsCss = PRINT_CSS_VARS
+    .map((v) => `${v}: ${rootStyle.getPropertyValue(v).trim() || "#1a1a1a"};`)
+    .join(" ");
+  const styleTag = document.createElementNS("http://www.w3.org/2000/svg", "style");
+  styleTag.textContent = `:root { ${varsCss} } svg { background: ${rootStyle.getPropertyValue("--color-background").trim() || "#fff"}; }`;
+  clone.insertBefore(styleTag, clone.firstChild);
+  return clone;
+}
+
+// Rasterizes the cleaned topology SVG to a PNG data URL at the given scale
+// (2x by default for crisp print/PDF output on retina-ish displays).
+async function svgToPngDataUrl(svg: SVGSVGElement, scale = 2): Promise<{ dataUrl: string; width: number; height: number }> {
+  const clean = cleanSvgForExport(svg);
+  const width = TOPO_VB_W;
+  const height = TOPO_VB_H;
+  const svgMarkup = new XMLSerializer().serializeToString(clean);
+  const svgBlob = new Blob([svgMarkup], { type: "image/svg+xml;charset=utf-8" });
+  const url = URL.createObjectURL(svgBlob);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = reject;
+      image.src = url;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = width * scale;
+    canvas.height = height * scale;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas context unavailable");
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--color-background").trim() || "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, 0, 0, width, height);
+    return { dataUrl: canvas.toDataURL("image/png", 1.0), width, height };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
 
 const WIRE_TYPES: { type: ConnType; color: string; dash?: string; label: string; shortLabel: string }[] = [
   { type: "STRAIGHT",  color: "#1a7a3f", dash: undefined, label: "Straight-Through", shortLabel: "ST" },
@@ -53,6 +125,17 @@ export function TopologyEditor({ dept }: Props) {
   const [editingLabelId, setEditingLabelId] = useState<string | null>(null);
   const [draftText, setDraftText] = useState("");
   const [zoom, setZoom] = useState(1);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const [exporting, setExporting] = useState<"pdf" | "docx" | null>(null);
+
+  // Marquee (rubber-band) multi-select — click and drag across empty canvas
+  // to draw a box; devices inside get highlighted live, the same gesture as
+  // dragging across text to select it in Word. Once highlighted, dragging
+  // any of them moves the whole group, and holding one down duplicates the
+  // whole group (see onNodePointerDown).
+  const [multiSelected, setMultiSelected] = useState<Set<string>>(new Set());
+  const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const groupDragRef = useRef<{ startX: number; startY: number; positions: Map<string, { x: number; y: number }> } | null>(null);
 
   const nodeById = useMemo(() => new Map(layout.nodes.map(n => [n.id, n])), [layout.nodes]);
   const labelById = useMemo(() => new Map(layout.labels.map(l => [l.id, l])), [layout.labels]);
@@ -74,13 +157,17 @@ export function TopologyEditor({ dept }: Props) {
       if (activeTag === "TEXTAREA" || activeTag === "INPUT") return;
       if (e.key === "Escape") {
         if (typeof tool === "object" || tool === "connect" || tool === "text") { setTool("select"); setConnectFrom(null); }
-        else setSelected(null);
+        else { setSelected(null); setMultiSelected(new Set()); }
       }
-      if ((e.key === "Delete" || e.key === "Backspace") && selected) {
+      if ((e.key === "Delete" || e.key === "Backspace") && (selected || multiSelected.size > 0)) {
         e.preventDefault();
-        if (selected.kind === "node") removeNode(selected.id);
-        if (selected.kind === "conn") removeConnection(selected.id);
-        if (selected.kind === "label") removeLabel(selected.id);
+        if (multiSelected.size > 0) {
+          multiSelected.forEach((id) => removeNode(id));
+          setMultiSelected(new Set());
+        }
+        if (selected?.kind === "node") removeNode(selected.id);
+        if (selected?.kind === "conn") removeConnection(selected.id);
+        if (selected?.kind === "label") removeLabel(selected.id);
         setSelected(null);
       }
       if ((e.ctrlKey || e.metaKey) && (e.key === "=" || e.key === "+")) {
@@ -143,6 +230,13 @@ export function TopologyEditor({ dept }: Props) {
     if (editingLabelId) commitLabelEdit();
     setSelected(null);
     setConnectFrom(null);
+    // Start a marquee (rubber-band) selection on empty canvas — devices
+    // inside the box get highlighted live as you drag, same as dragging
+    // across text to select it.
+    if (tool === "select") {
+      setMultiSelected(new Set());
+      setMarquee({ x0: x, y0: y, x1: x, y1: y });
+    }
   };
 
   // Double-click anywhere on empty canvas → drop a note right there and
@@ -165,11 +259,132 @@ export function TopologyEditor({ dept }: Props) {
   };
 
   const deleteSelected = () => {
+    if (multiSelected.size > 0) {
+      multiSelected.forEach((id) => removeNode(id));
+      setMultiSelected(new Set());
+    }
     if (!selected) return;
     if (selected.kind === "node") removeNode(selected.id);
     if (selected.kind === "conn") removeConnection(selected.id);
     if (selected.kind === "label") removeLabel(selected.id);
     setSelected(null);
+  };
+
+  // Every edit already auto-persists to storage the moment it happens
+  // (see useTopologyLayout's commit()), so SAVE has nothing new to write —
+  // it just gives the person a visible "yes, it's saved" confirmation for
+  // the familiar Ctrl+S habit.
+  const handleSave = () => {
+    setSavedFlash(true);
+    window.setTimeout(() => setSavedFlash(false), 1400);
+  };
+
+  // Opens a clean, print-only view of the topology in a new tab and
+  // triggers the browser's print dialog. Choosing "Save as PDF" as the
+  // destination there is the standard, dependency-free way to get a PDF
+  // that exactly matches what's on screen.
+  const handlePrint = () => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const clean = cleanSvgForExport(svg);
+    const svgMarkup = new XMLSerializer().serializeToString(clean);
+    const win = window.open("", "_blank", "noopener,noreferrer");
+    if (!win) return;
+    win.document.write(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>${dept.name} — Topology</title>
+<style>
+  @page { size: landscape; margin: 10mm; }
+  html, body { margin: 0; padding: 0; background: #fff; }
+  body { display: flex; flex-direction: column; align-items: center; font-family: system-ui, sans-serif; padding: 12px 0; }
+  h1 { font-size: 14px; margin: 0 0 10px; letter-spacing: 0.05em; text-transform: uppercase; color: #111; }
+  svg { width: 100%; height: auto; max-width: 100%; }
+</style>
+</head>
+<body>
+  <h1>${dept.name} (${dept.acronym}) — Network Topology</h1>
+  ${svgMarkup}
+</body>
+</html>`);
+    win.document.close();
+    win.onload = () => { win.focus(); win.print(); };
+  };
+
+  // Renders the topology to PNG and drops it into a landscape PDF page —
+  // a real, directly-downloaded .pdf file (no print dialog step needed).
+  const handleSaveAsPdf = async () => {
+    const svg = svgRef.current;
+    if (!svg || exporting) return;
+    setExporting("pdf");
+    try {
+      const { dataUrl, width, height } = await svgToPngDataUrl(svg, 2);
+      const pdf = new jsPDF({ orientation: "landscape", unit: "pt", format: [width + 40, height + 70] });
+      pdf.setFontSize(12);
+      pdf.text(`${dept.name} (${dept.acronym}) — Network Topology`, 20, 28);
+      pdf.addImage(dataUrl, "PNG", 20, 45, width, height);
+      pdf.save(`${dept.acronym}-topology.pdf`);
+    } finally {
+      setExporting(null);
+    }
+  };
+
+  // Renders the topology to PNG and embeds it into a real .docx file.
+  const handleSaveAsDocx = async () => {
+    const svg = svgRef.current;
+    if (!svg || exporting) return;
+    setExporting("docx");
+    try {
+      const { dataUrl, width, height } = await svgToPngDataUrl(svg, 2);
+      const base64 = dataUrl.split(",")[1];
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+      // Keep the embedded image within a normal page width regardless of
+      // how large the canvas got, preserving its aspect ratio.
+      const maxDocxWidthPx = 620;
+      const ratio = Math.min(1, maxDocxWidthPx / width);
+
+      const doc = new Document({
+        sections: [{
+          children: [
+            new Paragraph({
+              heading: HeadingLevel.HEADING_1,
+              alignment: AlignmentType.CENTER,
+              text: `${dept.name} (${dept.acronym})`,
+            }),
+            new Paragraph({
+              alignment: AlignmentType.CENTER,
+              text: "Network Topology",
+            }),
+            new Paragraph({
+              alignment: AlignmentType.CENTER,
+              children: [
+                new ImageRun({
+                  type: "png",
+                  data: bytes,
+                  transformation: { width: Math.round(width * ratio), height: Math.round(height * ratio) },
+                }),
+              ],
+            }),
+          ],
+        }],
+      });
+
+      const blob = await Packer.toBlob(doc);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${dept.acronym}-topology.docx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(null);
+    }
   };
 
   const startEditingLabel = (id: string) => {
@@ -197,6 +412,37 @@ export function TopologyEditor({ dept }: Props) {
   const onSvgPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     const { x, y } = clientToSvg(e.clientX, e.clientY);
     setCursor({ x, y });
+
+    // Growing the marquee box — recompute which devices fall inside it on
+    // every move, so the highlight updates live, the same way a text
+    // selection grows as you drag across more words.
+    if (marquee) {
+      const next = { ...marquee, x1: x, y1: y };
+      setMarquee(next);
+      const minX = Math.min(next.x0, next.x1), maxX = Math.max(next.x0, next.x1);
+      const minY = Math.min(next.y0, next.y1), maxY = Math.max(next.y0, next.y1);
+      const inside = new Set<string>();
+      layout.nodes.forEach((n) => {
+        if (n.x >= minX && n.x <= maxX && n.y >= minY && n.y <= maxY) inside.add(n.id);
+      });
+      setMultiSelected(inside);
+      return;
+    }
+
+    // Dragging any device that belongs to the current highlighted group
+    // moves the whole group together, preserving everyone's relative
+    // position — like dragging selected text moves the whole selection.
+    if (groupDragRef.current) {
+      const { startX, startY, positions } = groupDragRef.current;
+      const dx = x - startX, dy = y - startY;
+      positions.forEach((pos, id) => {
+        const nx = Math.max(0, Math.min(TOPO_VB_W, pos.x + dx));
+        const ny = Math.max(0, Math.min(TOPO_VB_H, pos.y + dy));
+        moveNode(id, nx, ny);
+      });
+      return;
+    }
+
     if (!drag) return;
     // Same free-range clamp as placement — devices/labels can be dragged
     // anywhere across the full canvas, not locked to a small centered box.
@@ -206,7 +452,11 @@ export function TopologyEditor({ dept }: Props) {
     else moveLabel(drag.id, nx, ny);
   };
 
-  const endDrag = () => setDrag(null);
+  const endDrag = () => {
+    setDrag(null);
+    setMarquee(null);
+    groupDragRef.current = null;
+  };
 
   const onNodePointerDown = (id: string) => (e: React.PointerEvent) => {
     e.stopPropagation();
@@ -218,8 +468,35 @@ export function TopologyEditor({ dept }: Props) {
       return;
     }
     if (editingLabelId) commitLabelEdit();
-    setSelected({ kind: "node", id });
     const { x, y } = clientToSvg(e.clientX, e.clientY);
+
+    // Grabbing any device that's part of the current highlighted group (from
+    // a marquee drag) instantly duplicates the WHOLE group, and the drag
+    // that follows moves that new copy — no waiting, just highlight then
+    // drag. The originals stay exactly where they were.
+    if (multiSelected.has(id) && multiSelected.size > 1) {
+      const idMap = new Map<string, string>();
+      multiSelected.forEach((selId) => idMap.set(selId, uid("n")));
+      const newPositions = new Map<string, { x: number; y: number }>();
+      multiSelected.forEach((selId) => {
+        const src = nodeById.get(selId);
+        if (src) {
+          addNode(src.type, src.x, src.y, idMap.get(selId));
+          newPositions.set(idMap.get(selId)!, { x: src.x, y: src.y });
+        }
+      });
+      const newIds = new Set(Array.from(idMap.values()));
+      setMultiSelected(newIds);
+      setSelected({ kind: "node", id: idMap.get(id)! });
+      groupDragRef.current = { startX: x, startY: y, positions: newPositions };
+      return;
+    }
+
+    // Normal single-device path — plain move, no copying. Also collapses
+    // any stale multi-selection, since grabbing a device outside the
+    // highlighted set starts a fresh single selection.
+    setMultiSelected(new Set());
+    setSelected({ kind: "node", id });
     setDrag({ kind: "node", id, offX: x - node.x, offY: y - node.y });
   };
 
@@ -399,16 +676,22 @@ export function TopologyEditor({ dept }: Props) {
             {layout.nodes.map(n => {
               const isSel = selected?.kind === "node" && selected.id === n.id;
               const isConnFrom = connectFrom === n.id;
+              const isMulti = multiSelected.has(n.id);
               return (
                 <g key={n.id}>
                   <g transform={`translate(${n.x},${n.y})`}
                      style={{ cursor: tool === "connect" ? "cell" : "grab" }}
                      onPointerDown={onNodePointerDown(n.id)}
                      onDoubleClick={(e) => e.stopPropagation()}>
+                    {/* Word-style highlight tint for devices caught inside a
+                        marquee (rubber-band) selection. */}
+                    {isMulti && (
+                      <circle r={CHIP_R + 4} fill="var(--color-accent)" opacity={0.18} />
+                    )}
                     <circle r={CHIP_R} fill="none"
-                      stroke={isConnFrom ? "var(--color-accent)" : isSel ? "var(--color-primary)" : "none"}
-                      strokeWidth={isSel || isConnFrom ? 1.8 : 1}
-                      strokeDasharray={isSel || isConnFrom ? "3 2" : undefined} />
+                      stroke={isMulti ? "var(--color-accent)" : isConnFrom ? "var(--color-accent)" : isSel ? "var(--color-primary)" : "none"}
+                      strokeWidth={isMulti || isSel || isConnFrom ? 1.8 : 1}
+                      strokeDasharray={isMulti || isSel || isConnFrom ? "3 2" : undefined} />
                     <DeviceGlyph type={n.type} size={ICON_SIZE} />
                   </g>
                   <text x={n.x} y={n.y + CHIP_R + 13}
@@ -419,6 +702,19 @@ export function TopologyEditor({ dept }: Props) {
                 </g>
               );
             })}
+
+            {/* Marquee (rubber-band) selection box — translucent while
+                actively dragging, same visual language as highlighting text
+                by dragging across it. */}
+            {marquee && (
+              <rect
+                x={Math.min(marquee.x0, marquee.x1)} y={Math.min(marquee.y0, marquee.y1)}
+                width={Math.abs(marquee.x1 - marquee.x0)} height={Math.abs(marquee.y1 - marquee.y0)}
+                fill="var(--color-accent)" opacity={0.12}
+                stroke="var(--color-accent)" strokeWidth={1} strokeDasharray="3 2"
+                pointerEvents="none"
+              />
+            )}
 
             {/* Text labels — freeform notes, support multiple lines (VLAN
                 tables, credentials, etc.), not just a single word. */}
@@ -577,11 +873,11 @@ export function TopologyEditor({ dept }: Props) {
           {/* Delete */}
           <button
             onClick={deleteSelected}
-            disabled={!selected}
+            disabled={!selected && multiSelected.size === 0}
             title="Delete selected (Del / Backspace)"
             className={
               "flex items-center gap-1.5 font-mono text-[10px] tracking-[0.08em] px-2.5 py-1.5 border rounded-sm transition-colors " +
-              (selected
+              (selected || multiSelected.size > 0
                 ? "border-destructive text-destructive hover:bg-destructive hover:text-white"
                 : "border-border text-muted-foreground opacity-40 cursor-not-allowed")
             }
@@ -593,6 +889,51 @@ export function TopologyEditor({ dept }: Props) {
           </button>
 
           <div className="flex-1" />
+
+          {/* Open — load a previously-exported .json topology file from disk,
+              replacing the current canvas (after confirmation). Lives here
+              inside the FILE menu below via the "Open…" item; kept close by
+              since it drives that hidden input. */}
+
+          {/* FILE menu — Open / Save / Save As / Print / Save as PDF / Save as DOCX,
+              all in one place instead of a row of loose buttons. */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                title="File options"
+                className="font-mono text-[10px] tracking-[0.12em] px-3 py-1.5 border border-border hover:border-ink transition-colors rounded-sm"
+              >
+                {savedFlash ? "✓ SAVED" : "FILE"}
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="font-mono text-[11px] tracking-[0.04em]">
+              <DropdownMenuItem
+                onClick={() => {
+                  if (confirm("Open a topology file? This will replace everything currently on the canvas.")) {
+                    fileInputRef.current?.click();
+                  }
+                }}
+              >
+                Open…
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={handleSave}>
+                Save
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => exportToFile()}>
+                Save As… (.json)
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={handlePrint}>
+                Print…
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={handleSaveAsPdf} disabled={exporting !== null}>
+                {exporting === "pdf" ? "Saving PDF…" : "Save as PDF"}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={handleSaveAsDocx} disabled={exporting !== null}>
+                {exporting === "docx" ? "Saving DOCX…" : "Save as DOCX"}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
 
           {/* Hidden file input driving "Open" — kept outside the visible
               button so the native file-picker chrome never shows through
@@ -614,31 +955,6 @@ export function TopologyEditor({ dept }: Props) {
               }
             }}
           />
-
-          {/* Open — load a previously-exported .json topology file from disk,
-              replacing the current canvas (after confirmation). */}
-          <button
-            onClick={() => {
-              if (confirm("Open a topology file? This will replace everything currently on the canvas.")) {
-                fileInputRef.current?.click();
-              }
-            }}
-            title="Open a topology file from your computer"
-            className="font-mono text-[10px] tracking-[0.12em] px-3 py-1.5 border border-border hover:border-ink transition-colors rounded-sm"
-          >
-            OPEN
-          </button>
-
-          {/* Save As — downloads the current topology as a .json file, the
-              way Packet Tracer writes a .pkt to disk. The browser's own
-              save dialog handles picking where it lands on the user's PC. */}
-          <button
-            onClick={() => exportToFile()}
-            title="Save this topology as a file on your computer"
-            className="font-mono text-[10px] tracking-[0.12em] px-3 py-1.5 border border-border hover:border-ink transition-colors rounded-sm"
-          >
-            SAVE AS
-          </button>
 
           {/* Reset */}
           <button
